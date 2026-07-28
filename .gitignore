@@ -30,10 +30,11 @@ iris
 bin/
 dist/
 
-# 会话 / cookie
+# 会话 / cookie 运行时数据（不影响源码 session_history.go）
 *.session
 *.cookie
-session_*
+session_*.json
+session_*.dat
 cookies/
 
 # IDE / 编辑器
