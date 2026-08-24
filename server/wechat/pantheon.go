@@ -57,13 +57,16 @@ type RunStatusResult struct {
 	Agent *AgentInfo `json:"agent,omitempty"`
 }
 
-// MessageInfo messages.by_run 返回的单条消息
+// MessageInfo messages.by_run 返回的单条消息事件
 type MessageInfo struct {
-	Seq        int64  `json:"seq"`
-	MessageID  string `json:"message_id"`
-	Type       string `json:"type"`
-	SenderRole string `json:"sender_role"`
-	Inline     string `json:"inline,omitempty"`
+	EventID    string          `json:"event_id"`
+	RunID      string          `json:"run_id"`
+	EventType  string          `json:"event_type"`
+	Seq        int64           `json:"seq"`
+	MessageID  string          `json:"message_id"`
+	MessageSeq int64           `json:"message_seq"`
+	AckState   string          `json:"ack_state"`
+	Payload    json.RawMessage `json:"payload"`
 }
 
 // MessagesByRunResult messages.by_run 返回
@@ -245,12 +248,23 @@ func FormatMessages(msgs []MessageInfo) string {
 	var b []byte
 	b = append(b, fmt.Sprintf("📬 消息 (%d条)\n\n", len(msgs))...)
 	for i, m := range msgs {
-		inline := m.Inline
+		// 从 payload 提取 type 和 inline 内容
+		var payload struct {
+			Type   string `json:"type"`
+			Sender struct {
+				Role string `json:"role"`
+			} `json:"sender"`
+			Payload struct {
+				Inline string `json:"inline"`
+			} `json:"payload_ref"`
+		}
+		_ = json.Unmarshal(m.Payload, &payload)
+		inline := payload.Payload.Inline
 		if inline == "" {
 			inline = "(无内容)"
 		}
-		b = append(b, fmt.Sprintf("%d. [%s] %s→%s\n   %s\n",
-			i+1, m.Type, m.SenderRole, "", truncate(inline, 60))...)
+		b = append(b, fmt.Sprintf("%d. [%s] %s→\n   %s\n",
+			i+1, payload.Type, payload.Sender.Role, truncate(inline, 60))...)
 	}
 	return string(b)
 }
