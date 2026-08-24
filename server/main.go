@@ -771,6 +771,8 @@ func (sm *sessionManager) handleSysCommand(from, text string) {
 		sm.cmdAgents(from)
 	case ":send", ":s":
 		sm.cmdSend(from, args)
+	case ":msg", ":m":
+		sm.cmdMsg(from, args)
 	default:
 		sm.client.SendMessage(context.Background(), from,
 			fmt.Sprintf("未知命令: `%s`\n发 `:help` 查看", cmd))
@@ -802,6 +804,7 @@ func (sm *sessionManager) sendHelp(from string) {
 		"| `:pantheon` | 列出 Pantheon run |",
 		"| `:agents` | 列出 Beacon agent |",
 		"| `:send <pane> <msg>` | 给 tmux pane 发消息 |",
+		"| `:msg <run_id> <msg>` | 给 Pantheon run 发 msg bus 消息 |",
 		"",
 		"**目标格式**",
 		"| 目标 | 含义 |",
@@ -1727,4 +1730,57 @@ func (sm *sessionManager) cmdSend(from, args string) {
 		return
 	}
 	sm.client.SendMessage(context.Background(), from, fmt.Sprintf("✅ 已发送到 `%s`", paneID))
+}
+
+// === :msg — Pantheon msg bus 消息发送 ===
+
+func (sm *sessionManager) cmdMsg(from, args string) {
+	// :msg <run_id> <消息>
+	// :msg <run_id> directive <消息>  — 显式指定消息类型（默认 directive）
+	parts := strings.SplitN(args, " ", 2)
+	if len(parts) < 2 {
+		sm.client.SendMessage(context.Background(), from,
+			"用法: `:msg <run_id> <消息>`\n或 `:msg <run_id> <type> <消息>`\n类型: directive(默认) / report / state / block / complete / verify / ack / nack\n例: `:msg run_abc123 修复完成`")
+		return
+	}
+	runID := strings.TrimSpace(parts[0])
+	rest := strings.TrimSpace(parts[1])
+	if runID == "" || rest == "" {
+		sm.client.SendMessage(context.Background(), from, "run_id 和消息不能为空")
+		return
+	}
+
+	// 检查是否指定了消息类型
+	msgType := "directive"
+	text := rest
+	typeParts := strings.SplitN(rest, " ", 2)
+	validTypes := map[string]bool{
+		"directive": true, "report": true, "state": true, "block": true,
+		"complete": true, "verify": true, "ack": true, "nack": true,
+	}
+	if len(typeParts) == 2 && validTypes[typeParts[0]] {
+		msgType = typeParts[0]
+		text = strings.TrimSpace(typeParts[1])
+	}
+	if text == "" {
+		sm.client.SendMessage(context.Background(), from, "消息内容不能为空")
+		return
+	}
+
+	// Iris 以 "用户" 身份发消息，sender_role = pm（Project Master = 用户）
+	// recipient_role = worker（发给执行任务的 agent）
+	ctx, cancel := context.WithTimeout(context.Background(), wechat.DefaultTimeout)
+	defer cancel()
+	result, err := sm.pantheonClient().PublishMessage(ctx, runID, "pm", "worker", msgType, text)
+	if err != nil {
+		sm.client.SendMessage(context.Background(), from, fmt.Sprintf("❌ 发送失败: %v", err))
+		return
+	}
+	deduped := ""
+	if result.Deduped {
+		deduped = " (deduped)"
+	}
+	sm.client.SendMessage(context.Background(), from,
+		fmt.Sprintf("✅ 消息已发送\nRun: `%s`\n类型: %s\nSeq: %d%s",
+			truncate(runID, 12), msgType, result.MessageSeq, deduped))
 }
