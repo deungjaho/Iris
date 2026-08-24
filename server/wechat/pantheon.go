@@ -265,10 +265,19 @@ type BeaconPane struct {
 	Acknowledged bool   `json:"acknowledged"`
 }
 
+// BeaconLastCompleted Beacon status 里的 last_completed
+type BeaconLastCompleted struct {
+	Pane    string `json:"pane"`
+	Session string `json:"session"`
+	Window  string `json:"window"`
+	Summary string `json:"summary"`
+	Time    int64  `json:"time"`
+}
+
 // BeaconStatus beacon status 返回
 type BeaconStatus struct {
-	Panes         map[string]BeaconPane `json:"panes"`
-	LastCompleted string                `json:"last_completed,omitempty"`
+	Panes         map[string]BeaconPane    `json:"panes"`
+	LastCompleted *BeaconLastCompleted     `json:"last_completed,omitempty"`
 }
 
 // BeaconClient 封装 beacon CLI 调用
