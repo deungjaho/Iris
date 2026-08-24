@@ -276,8 +276,8 @@ type BeaconLastCompleted struct {
 
 // BeaconStatus beacon status 返回
 type BeaconStatus struct {
-	Panes         map[string]BeaconPane    `json:"panes"`
-	LastCompleted *BeaconLastCompleted     `json:"last_completed,omitempty"`
+	Panes         map[string]BeaconPane `json:"panes"`
+	LastCompleted *BeaconLastCompleted  `json:"last_completed,omitempty"`
 }
 
 // BeaconClient 封装 beacon CLI 调用
