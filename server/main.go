@@ -32,6 +32,13 @@ type Config struct {
 	Remote       wechat.RemoteConfig `json:"remote,omitempty"`      // 远程 SSH 配置
 	Home         HomeConfig          `json:"home,omitempty"`        // Home session 配置
 	MnemosURL    string              `json:"mnemosURL,omitempty"`   // Mnemos 向量库地址（预留）
+	Pantheon     PantheonConfig      `json:"pantheon,omitempty"`    // Pantheon CLI 配置
+}
+
+// PantheonConfig Pantheon CLI 连接配置
+type PantheonConfig struct {
+	CliPath    string `json:"cliPath,omitempty"`    // pantheon 二进制路径，默认 "pantheon"
+	SocketPath string `json:"socketPath,omitempty"` // Unix socket 路径，空则用默认
 }
 
 // HomeConfig Home session 配置
@@ -198,9 +205,9 @@ type runningSession struct {
 
 // userState 一个微信用户的所有 session 状态
 type userState struct {
-	sessions           []*sessionInfo
-	activeIdx          int // -1 表示无活动 session
-	running            *runningSession
+	sessions            []*sessionInfo
+	activeIdx           int // -1 表示无活动 session
+	running             *runningSession
 	lastRemoteSessions  []wechat.RemoteSession // :ls m 缓存
 	lastOmarchySessions []wechat.RemoteSession // :ls o 缓存
 	lastTmuxAgents      []wechat.TmuxAgent     // :ls t 缓存
@@ -266,11 +273,12 @@ func (sm *sessionManager) createHomeSession() *sessionInfo {
 
 // HandleMessage 处理来自微信用户的消息
 // 前缀体系（均支持半角/全角）：
-//   : / ：  — Iris 系统命令（:new :list :mode 等）
-//   / / ／  — 转发给 Claude Code（/help /clear 等）
-//   ! / ！  — 直接执行 bash 命令
-//   @ / ＠  — 切换目标/上下文（@mac @omarchy @t0 @s0）
-//   $ / ＄  — 快速状态查询
+//
+//	: / ：  — Iris 系统命令（:new :list :mode 等）
+//	/ / ／  — 转发给 Claude Code（/help /clear 等）
+//	! / ！  — 直接执行 bash 命令
+//	@ / ＠  — 切换目标/上下文（@mac @omarchy @t0 @s0）
+//	$ / ＄  — 快速状态查询
 func (sm *sessionManager) HandleMessage(ctx context.Context, from, text string) {
 	if len(text) == 0 {
 		return
@@ -310,6 +318,8 @@ func (sm *sessionManager) HandleMessage(ctx context.Context, from, text string) 
 }
 
 // forwardToSession 转发消息到当前 session（运行中或新建）
+// 有运行中的 session → 转发到 replyChan
+// 没有运行中的 session → 意图判断（规则匹配，可能误判）
 func (sm *sessionManager) forwardToSession(ctx context.Context, from, text string) {
 	sm.mu.Lock()
 	user := sm.getOrCreateUser(from)
@@ -326,15 +336,47 @@ func (sm *sessionManager) forwardToSession(ctx context.Context, from, text strin
 		return
 	}
 
-	// 没有运行中的 session，需要启动一个
-	// 在锁内确定 info，避免竞态
+	// 检查当前活动 session 是否是 home（sandbox）
+	// home session 的消息直接走 spawn 路径（保留原有行为）
+	activeIsHome := false
+	if user.activeIdx >= 0 && user.activeIdx < len(user.sessions) {
+		activeIsHome = user.sessions[user.activeIdx].IsHome
+	}
+	sm.mu.Unlock()
+
+	// 如果当前活动 session 是 home 或非 home 的 Iris session，走原有 spawn 路径
+	// 意图判断只在没有活动 session 时触发
+	if activeIsHome || user.activeIdx >= 0 {
+		sm.startSessionForMessage(ctx, from, text)
+		return
+	}
+
+	// 没有活动 session → 意图判断
+	intent := DetectIntent(text)
+	switch intent {
+	case IntentHelp:
+		sm.sendHelp(from)
+	case IntentQuery:
+		sm.handleQueryIntent(ctx, from, text)
+	case IntentDirective:
+		sm.handleDirectiveIntent(ctx, from, text)
+	case IntentConversation:
+		// 对话类 → 走 home session（sandbox）
+		sm.startSessionForMessage(ctx, from, text)
+	}
+}
+
+// startSessionForMessage 走原有的 session 启动逻辑（spawn claude）
+// 用于对话类消息或已有活动 session 时的消息转发
+func (sm *sessionManager) startSessionForMessage(ctx context.Context, from, text string) {
+	sm.mu.Lock()
+	user := sm.getOrCreateUser(from)
+
 	var info *sessionInfo
 	if user.activeIdx >= 0 && user.activeIdx < len(user.sessions) {
-		// resume 活动 session
 		info = user.sessions[user.activeIdx]
 		info.LastActive = time.Now()
 	} else {
-		// 创建新 session
 		info = &sessionInfo{
 			CreatedAt:  time.Now(),
 			LastActive: time.Now(),
@@ -344,20 +386,49 @@ func (sm *sessionManager) forwardToSession(ctx context.Context, from, text strin
 		user.sessions = append(user.sessions, info)
 		user.activeIdx = len(user.sessions) - 1
 		sm.trimSessions(user)
-		// trimSessions 可能调整 activeIdx，重新获取 info
 		if user.activeIdx >= 0 && user.activeIdx < len(user.sessions) {
 			info = user.sessions[user.activeIdx]
 		}
 	}
-
-	// 标记正在启动，防止并发启动同一 session
-	// 用 running 占位，startSession 会替换为真正的 running
-	// 这里不能直接设 running，因为 bridge 还没创建
-	// 改为：在锁内调用 startSession 的锁内部分
 	sm.mu.Unlock()
 
-	// 启动 session（startSession 内部会重新加锁并检查）
 	sm.startSession(ctx, from, info, text)
+}
+
+// handleQueryIntent 处理查询类意图：调 beacon/pantheon 查状态
+func (sm *sessionManager) handleQueryIntent(ctx context.Context, from, text string) {
+	// 先查 Beacon agent 状态
+	bc := wechat.NewBeaconClient("")
+	bctx, bcancel := context.WithTimeout(ctx, wechat.DefaultTimeout)
+	defer bcancel()
+	status, err := bc.Status(bctx)
+	if err != nil {
+		sm.client.SendMessage(context.Background(), from, fmt.Sprintf("❌ Beacon 查询失败: %v", err))
+		return
+	}
+	sm.client.SendMessage(context.Background(), from, wechat.FormatBeaconStatus(status))
+
+	// 再查 Pantheon run 列表
+	pctx, pcancel := context.WithTimeout(ctx, wechat.DefaultTimeout)
+	defer pcancel()
+	runs, err := sm.pantheonClient().ListRuns(pctx)
+	if err != nil {
+		sm.client.SendMessage(context.Background(), from, fmt.Sprintf("❌ Pantheon 查询失败: %v", err))
+		return
+	}
+	sm.client.SendMessage(context.Background(), from, wechat.FormatRuns(runs, 5))
+}
+
+// handleDirectiveIntent 处理指令类意图
+// 当前阶段：提示用户用 :send 或 :pantheon 命令
+// 未来可以加自然语言解析（"告诉 xxx 做 yyy" → 自动 send-keys）
+func (sm *sessionManager) handleDirectiveIntent(ctx context.Context, from, text string) {
+	sm.client.SendMessage(context.Background(), from,
+		"指令类消息请用显式命令：\n"+
+			"`:send <pane_id> <消息>` — 给 tmux pane 发消息\n"+
+			"`:pantheon` — 查看 run 列表\n"+
+			"`:agents` — 查看 agent 状态\n"+
+			"\n或直接发消息到 home session 对话")
 }
 
 // startSession 启动一个 bridge session
@@ -694,6 +765,12 @@ func (sm *sessionManager) handleSysCommand(from, text string) {
 		sm.cmdStop(from)
 	case ":status", ":st":
 		sm.cmdStatus(from)
+	case ":pantheon", ":pa", ":runs":
+		sm.cmdPantheon(from, args)
+	case ":agents", ":ag":
+		sm.cmdAgents(from)
+	case ":send", ":s":
+		sm.cmdSend(from, args)
 	default:
 		sm.client.SendMessage(context.Background(), from,
 			fmt.Sprintf("未知命令: `%s`\n发 `:help` 查看", cmd))
@@ -722,6 +799,9 @@ func (sm *sessionManager) sendHelp(from string) {
 		"| `:mode <m>` | 切换模式 |",
 		"| `:stop` | 停止会话 |",
 		"| `:status` | 查看状态 |",
+		"| `:pantheon` | 列出 Pantheon run |",
+		"| `:agents` | 列出 Beacon agent |",
+		"| `:send <pane> <msg>` | 给 tmux pane 发消息 |",
 		"",
 		"**目标格式**",
 		"| 目标 | 含义 |",
@@ -976,17 +1056,19 @@ print(json.dumps(sessions))
 
 // cmdListTmux 列出 tmux agent
 func (sm *sessionManager) cmdListTmux(from string) {
-	if sm.cfg.Remote.Host == "" {
-		sm.client.SendMessage(context.Background(), from, "未配置远程主机")
-		return
-	}
-
 	sm.client.SendMessage(context.Background(), from, "🔍 查询 tmux agent...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	agents, err := wechat.ListTmuxAgents(ctx, sm.cfg.Remote.Host)
+	// 如果配置了远程主机，查远程；否则查本地
+	var agents []wechat.TmuxAgent
+	var err error
+	if sm.cfg.Remote.Host != "" {
+		agents, err = wechat.ListTmuxAgents(ctx, sm.cfg.Remote.Host)
+	} else {
+		agents, err = wechat.ListLocalPanes(ctx)
+	}
 	if err != nil {
 		sm.client.SendMessage(context.Background(), from,
 			fmt.Sprintf("❌ 查询失败: %v", err))
@@ -1550,6 +1632,7 @@ func runLogin() {
 		Remote:       existing.Remote,
 		Home:         existing.Home,
 		MnemosURL:    existing.MnemosURL,
+		Pantheon:     existing.Pantheon,
 	}
 	if cfg.Cwd == "" {
 		cfg.Cwd, _ = os.Getwd()
@@ -1562,4 +1645,86 @@ func runLogin() {
 		log.Fatalf("write config: %v", err)
 	}
 	fmt.Printf("\n凭证已保存到 %s\n", cfgPath)
+}
+
+// === :pantheon — Pantheon run 查询 ===
+
+func (sm *sessionManager) pantheonClient() *wechat.PantheonClient {
+	cli := sm.cfg.Pantheon.CliPath
+	if cli == "" {
+		cli = "pantheon"
+	}
+	return wechat.NewPantheonClient(cli, sm.cfg.Pantheon.SocketPath)
+}
+
+func (sm *sessionManager) cmdPantheon(from, args string) {
+	arg := strings.TrimSpace(args)
+
+	if arg == "" {
+		// 列出最近 5 个 run
+		sm.client.SendMessage(context.Background(), from, "🔍 查询 Pantheon run...")
+		ctx, cancel := context.WithTimeout(context.Background(), wechat.DefaultTimeout)
+		defer cancel()
+		runs, err := sm.pantheonClient().ListRuns(ctx)
+		if err != nil {
+			sm.client.SendMessage(context.Background(), from, fmt.Sprintf("❌ 查询失败: %v", err))
+			return
+		}
+		sm.client.SendMessage(context.Background(), from, wechat.FormatRuns(runs, 5))
+		return
+	}
+
+	// :pantheon <run_id> — 查看指定 run 状态
+	ctx, cancel := context.WithTimeout(context.Background(), wechat.DefaultTimeout)
+	defer cancel()
+	result, err := sm.pantheonClient().RunStatus(ctx, arg)
+	if err != nil {
+		sm.client.SendMessage(context.Background(), from, fmt.Sprintf("❌ 查询失败: %v", err))
+		return
+	}
+	sm.client.SendMessage(context.Background(), from, wechat.FormatRunStatus(result))
+}
+
+// === :agents — Beacon agent 查询 ===
+
+func (sm *sessionManager) cmdAgents(from string) {
+	sm.client.SendMessage(context.Background(), from, "🔍 查询 Beacon agent...")
+	ctx, cancel := context.WithTimeout(context.Background(), wechat.DefaultTimeout)
+	defer cancel()
+	bc := wechat.NewBeaconClient("")
+	status, err := bc.Status(ctx)
+	if err != nil {
+		sm.client.SendMessage(context.Background(), from, fmt.Sprintf("❌ 查询失败: %v", err))
+		return
+	}
+	sm.client.SendMessage(context.Background(), from, wechat.FormatBeaconStatus(status))
+}
+
+// === :send — tmux send-keys ===
+
+func (sm *sessionManager) cmdSend(from, args string) {
+	// :send <pane_id> <消息>
+	parts := strings.SplitN(args, " ", 2)
+	if len(parts) < 2 {
+		sm.client.SendMessage(context.Background(), from,
+			"用法: `:send <pane_id> <消息>`\n例: `:send %5 hello`")
+		return
+	}
+	paneID := strings.TrimSpace(parts[0])
+	text := strings.TrimSpace(parts[1])
+	if paneID == "" || text == "" {
+		sm.client.SendMessage(context.Background(), from, "pane_id 和消息不能为空")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 本地执行（Iris 运行在 omarchy 上）
+	err := wechat.SendKeysToPane(ctx, "", paneID, text)
+	if err != nil {
+		sm.client.SendMessage(context.Background(), from, fmt.Sprintf("❌ 发送失败: %v", err))
+		return
+	}
+	sm.client.SendMessage(context.Background(), from, fmt.Sprintf("✅ 已发送到 `%s`", paneID))
 }
